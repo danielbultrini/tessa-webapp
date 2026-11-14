@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TESSA</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>TESSA</h1>
+  <p>Encode pixel art on an IBM chip, then read it back. Simulations use the chip's saved
+    calibration; you can also send the job to IBM hardware.</p>
+</header>
+
+<main>
+  <section class="card" id="controls">
+    <div class="row">
+      <label>Chip</label>
+      <div id="device-choice" class="choices">
+        <label><input type="radio" name="device" value="phoenix" checked> ibm_phoenix</label>
+        <label><input type="radio" name="device" value="fez"> ibm_fez</label>
+      </div>
+    </div>
+    <p id="device-info" class="note"></p>
+
+    <div class="row">
+      <label for="representation">Encode</label>
+      <select id="representation">
+        <option value="gray">Grayscale</option>
+        <option value="palette">Palette (symbolic: the image's own colours)</option>
+        <option value="color">Full colour (three channels per pixel)</option>
+        <option value="huevalue">Hue + value (saturation kept from the image)</option>
+        <option value="transition">Transition between two images</option>
+      </select>
+    </div>
+    <div class="row" id="colorspace-row" hidden>
+      <label for="colorspace">Colour space</label>
+      <select id="colorspace">
+        <option value="rgb">RGB (red, green, blue)</option>
+        <option value="hsv">HSV (hue, saturation, value)</option>
+        <option value="hsl">HSL (hue, saturation, lightness)</option>
+        <option value="ycbcr">YCbCr (brightness and two colour differences)</option>
+      </select>
+    </div>
+    <div class="row">
+      <label for="basis">Basis</label>
+      <select id="basis"></select>
+    </div>
+    <p id="basis-info" class="note"></p>
+
+    <div class="row">
+      <label for="mapping">Pixels to qubits</label>
+      <select id="mapping">
+        <option value="lines">Lines (row by row)</option>
+        <option value="squares">Squares</option>
+        <option value="rectangles">Rectangles</option>
+        <option value="patches">Patches (puzzle pieces)</option>
+        <option value="random">Random</option>
+      </select>
+      <span id="seed-box" hidden>
+        <label for="seed">Seed</label>
+        <input type="number" id="seed" value="0" min="0" max="999999">
+      </span>
+    </div>
+    <p id="mapping-info" class="note"></p>
+
+    <div class="row">
+      <label for="file-a" id="file-a-label">Image</label>
+      <input type="file" id="file-a" accept="image/*">
+    </div>
+    <div class="row" id="file-b-row" hidden>
+      <label for="file-b">Image B</label>
+      <input type="file" id="file-b" accept="image/*">
+    </div>
+    <p id="fit" class="note"></p>
+    <div id="palette-panel" hidden>
+      <div class="row">
+        <label>Palette order</label>
+        <div class="choices">
+          <button type="button" class="small" data-order="dark">Dark to light</button>
+          <button type="button" class="small" data-order="light">Light to dark</button>
+          <button type="button" class="small" data-order="hue">By hue</button>
+          <button type="button" class="small" data-order="shuffle">Shuffle</button>
+        </div>
+      </div>
+      <div id="palette-strip"></div>
+      <div class="axis"><span id="axis-start"></span><span id="axis-end"></span></div>
+      <p id="palette-info" class="note"></p>
+    </div>
+
+    <div class="row">
+      <label for="shots">Shots</label>
+      <input type="number" id="shots" value="8192" min="100" max="100000" step="100">
+    </div>
+    <div class="row" id="tvalues-row" hidden>
+      <label for="transition-values">Values</label>
+      <select id="transition-values">
+        <option value="gray">Grayscale</option>
+        <option value="palette">Palette (indexed colour, shared by both images)</option>
+      </select>
+    </div>
+    <div class="row" id="alphas-row" hidden>
+      <label for="alphas">Readout angles</label>
+      <input type="number" id="alphas" value="9" min="2" max="15">
+      <span class="note">evenly spaced from Z (0&deg;) to X (90&deg;)</span>
+    </div>
+
+    <div class="row">
+      <label>Run on</label>
+      <div class="choices">
+        <label><input type="radio" name="target" value="sim-noisy" checked> Simulator, calibrated noise</label>
+        <label><input type="radio" name="target" value="sim-ideal"> Simulator, no noise</label>
+        <label><input type="radio" name="target" value="ibm"> IBM hardware</label>
+      </div>
+    </div>
+    <div id="ibm-fields" hidden>
+      <div class="row">
+        <label for="token">IBM Cloud API key</label>
+        <input type="password" id="token" autocomplete="off">
+      </div>
+      <div class="row">
+        <label for="instance">Instance CRN</label>
+        <input type="text" id="instance" placeholder="crn:v1:bluemix:public:quantum-computing:..." autocomplete="off">
+      </div>
+      <p class="note">The key and CRN go to this app's server only to submit and check the
+        job. They are not stored, and the page forgets them when you close it. Hardware runs
+        the whole circuit at once, so a job can wait in IBM's queue for a long time.</p>
+    </div>
+
+    <button id="run" disabled>Run</button>
+    <span id="status" class="note"></span>
+  </section>
+
+  <section class="card" id="results" hidden>
+    <div class="images">
+      <figure>
+        <canvas id="input-canvas"></canvas>
+        <figcaption id="input-caption">Input</figcaption>
+      </figure>
+      <figure>
+        <canvas id="output-canvas"></canvas>
+        <figcaption id="output-caption">Read back</figcaption>
+      </figure>
+      <figure>
+        <canvas id="drr-canvas"></canvas>
+        <figcaption id="drr-caption">Best dynamic range recovery</figcaption>
+      </figure>
+      <figure>
+        <canvas id="chip-canvas"></canvas>
+        <figcaption>Chip: data qubits (circles) and address qubits (squares)</figcaption>
+      </figure>
+    </div>
+    <div class="row" id="alpha-row" hidden>
+      <label for="alpha">Readout angle</label>
+      <input type="range" id="alpha" min="0" max="8" value="0" step="1">
+      <span id="alpha-label"></span>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="outlines" checked> Outline the pixels each data qubit holds</label>
+    </div>
+    <div class="row" id="layer-row" hidden>
+      <label>Qubit map for</label>
+      <div class="choices" id="layer-choices"></div>
+    </div>
+    <p id="notes" class="note warn" hidden></p>
+    <p id="hover" class="note">Hover over a pixel or a data qubit to see where it lives.</p>
+    <p class="note">Noise pulls the read-back toward the middle of its range. Dynamic range
+      recovery (DRR) stretches it back, using only a few numbers from your image, such as its
+      minimum and maximum, or its mean and spread. TESSA tries every method and shows the one
+      that comes closest to your image. Choosing it needs your original image, which a real
+      use without the original would not have. Hue is never stretched, because it wraps
+      around.</p>
+    <pre id="metrics"></pre>
+
+    <h2>Download</h2>
+    <div class="row">
+      <label for="version">Version</label>
+      <select id="version">
+        <option value="raw">Raw read-back</option>
+        <option value="drr">Best dynamic range recovery</option>
+      </select>
+    </div>
+    <div class="row">
+      <label for="scale">Size</label>
+      <select id="scale">
+        <option value="1">1x (one pixel per pixel)</option>
+        <option value="4">4x</option>
+        <option value="8" selected>8x</option>
+        <option value="16">16x</option>
+      </select>
+    </div>
+    <div class="row buttons">
+      <button id="dl-png">Result (PNG)</button>
+      <button id="dl-outlined">Result with outlines (PNG)</button>
+      <button id="dl-json">Data (JSON)</button>
+    </div>
+    <div id="dl-transition" hidden>
+      <div class="row buttons">
+        <button id="dl-frame">This angle (PNG)</button>
+        <button id="dl-zip">Every angle (ZIP of PNGs)</button>
+        <button id="dl-gif">Animation (GIF)</button>
+      </div>
+      <div class="row">
+        <label for="gif-delay">GIF frame time</label>
+        <input type="number" id="gif-delay" value="250" min="20" max="5000" step="10"> ms
+        <label><input type="checkbox" id="gif-bounce" checked> Play back and forth</label>
+      </div>
+    </div>
+  </section>
+</main>
+<footer>
+  <p>Cover art by:
+    <a href="https://salvapixel.com/" target="_blank" rel="noopener">M.A. Kozhikkal (SalvaPixel)</a>,
+    <a href="https://www.artstation.com/leviatic" target="_blank" rel="noopener">M. Fish (Leviatic)</a>,
+    <a href="https://x.com/derekpxart" target="_blank" rel="noopener">D. Souza</a>,
+    <a href="https://diaspixels.artstation.com/" target="_blank" rel="noopener">E. Kılınç (Diaspixels)</a>,
+    D. Bultrini,
+    S. Cantori
+  </p>
+</footer>
+<script src="export.js"></script>
+<script src="split.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
