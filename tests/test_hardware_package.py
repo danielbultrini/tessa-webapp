@@ -170,6 +170,29 @@ def test_a_package_is_one_job_and_survives_a_dropped_connection(fake_ibm, tmp_pa
     assert (out / "summary.csv").read_text().startswith("label,")
 
 
+def test_an_image_too_big_for_the_chip_runs_in_parts_of_one_job(fake_ibm, tmp_path):
+    _png(tmp_path / "big.png", 12, 11, 7)  # 131 opaque pixels; the 3x4 grid holds 48
+    package = tmp_path / "big.toml"
+    package.write_text(
+        'name = "big"\ndevice = "fez"\nshots = 20000\n\n'
+        '[[runs]]\nlabel = "big"\nimage = "big.png"\nrepresentation = "gray"\n'
+        'basis = "z"\n'
+    )
+    out = tmp_path / "out"
+    hp.main(["run", str(package), "--out", str(out), "--poll", "0"])
+
+    assert len(FakeService.submitted) == 1  # one job
+    assert len(FakeService.submitted[0]) == 3  # one Z circuit for each of 3 parts
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["runs"][0]["bands"] == 3
+    summary = json.loads((out / "summary.json").read_text())["runs"][0]
+    assert summary["parts"] == 3 and summary["n_pixels"] == 131
+    assert summary["raw.mean_abs_error_255"] < 10
+    result = json.loads((out / "results" / "big" / "result.json").read_text())
+    assert (result["width"], result["height"], result["bands"]) == (12, 11, 3)
+    assert (out / "results" / "big" / "raw_x8.png").exists()
+
+
 def test_a_restart_finds_a_job_whose_reply_was_lost(fake_ibm, tmp_path):
     package = _package(tmp_path)
     out = tmp_path / "out"

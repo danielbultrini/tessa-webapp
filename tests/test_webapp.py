@@ -10,7 +10,7 @@ from typing import ClassVar
 
 import numpy as np
 import pytest
-from tessa import devices, mapping, pipeline, runners
+from tessa import devices, mapping, pipeline, runners, split
 
 WEBAPP = Path(__file__).resolve().parents[1]
 
@@ -287,6 +287,101 @@ def test_too_many_colours_for_a_constellation_are_refused():
     }
     with pytest.raises(ValueError, match="at most 64 colours"):
         pipeline.build_plan(request, devices.graph("phoenix"))
+
+
+# ----------------------------------------------------------------------
+# Images too big for the chip
+# ----------------------------------------------------------------------
+def test_a_big_image_splits_into_bands_that_each_fit():
+    """Bands of nearly equal size in reading order, each cropped to its rows, and
+    one band (the request itself) when the image fits."""
+    graph = devices.graph("fez")  # 448 slots
+    image = sprite(w=40, h=30, seed=1)  # 1196 opaque pixels
+    request = {"representation": "gray", "basis": "z", "images": [image]}
+    bands = split.band_requests(request, graph.capacity)
+    assert len(bands) == split.band_count(request, graph.capacity) == 3
+    sizes = []
+    for j, band in enumerate(bands):
+        top = band["split"]["top"]
+        assert band["split"] == {"band": j, "of": 3, "top": top, "height": 30}
+        plan = pipeline.build_plan(band, graph)  # fits, or this raises
+        sizes.append(int(plan.mask.sum()))
+    assert sum(sizes) == 1196 and max(sizes) - min(sizes) <= 1
+    assert split.band_requests({**request, "basis": "zx"}, graph.capacity)[0]["split"]
+    small = {**request, "images": [sprite(w=10, h=10)]}
+    assert split.band_requests(small, graph.capacity) == [small]
+    with pytest.raises(ValueError, match="band 3 does not exist"):
+        split.band_request(request, graph.capacity, 3)
+
+
+@pytest.mark.parametrize(
+    ("rep", "basis", "extra"),
+    [
+        ("gray", "zx", {}),
+        ("palette", "sphere2", {}),
+        ("color", "zx", {"colorspace": "hsv"}),
+        ("transition", "zx", {"transition_values": "palette", "alphas": 3}),
+    ],
+)
+def test_the_joined_bands_are_the_whole_image(rep, basis, extra):
+    colours = PALETTE if rep in ("palette", "transition") else None
+    images = [sprite(w=36, h=30, seed=s, colours=colours) for s in (2, 3)]
+    request = {
+        "device": "fez",
+        "representation": rep,
+        "basis": basis,
+        "images": images[: 2 if rep == "transition" else 1],
+        "shots": 20_000,
+        "noise": "none",
+        **extra,
+    }
+    count = split.band_count(request, devices.graph("fez").capacity)
+    assert count > 1
+    out = split.join([runners.simulate({**request, "band": j}) for j in range(count)])
+    assert (out["width"], out["height"], out["bands"]) == (36, 30, count)
+    assert "split" not in out
+    want = rgba_of(images[0]["rgba"], 36, 30)
+    got = rgba_of(out["image"] if "image" in out else out["frames"][0], 36, 30)
+    opaque = want[..., 3] >= 128
+    assert (got[..., 3] == 255).tolist() == opaque.tolist()
+    band = np.array(out["pixel_band"]).reshape(30, 36)
+    assert ((band >= 0) == opaque).all()
+    assert set(band[opaque].tolist()) == set(range(count))
+    if rep == "palette":  # every band kept the whole palette: exact colours
+        assert (got[opaque, :3] == want[opaque, :3]).all()
+        assert out["metrics"]["pixels_exact"] == 1.0
+    elif rep == "gray":
+        assert out["metrics"]["mean_abs_error_255"] < 6
+
+
+def test_a_big_image_is_one_ibm_job(monkeypatch):
+    import qiskit_ibm_runtime
+    from qiskit_aer.primitives import SamplerV2 as AerSampler
+
+    runs = []
+
+    class FakeSampler:
+        def __init__(self, mode):
+            pass
+
+        def run(self, pubs, shots):
+            runs.append(len(pubs))
+            job = FakeJob(AerSampler(seed=0).run(pubs, shots=shots).result())
+            FakeService.jobs["fake-job"] = job
+            return job
+
+    monkeypatch.setattr(runners, "_service", lambda credentials: FakeService())
+    monkeypatch.setattr(qiskit_ibm_runtime, "SamplerV2", FakeSampler)
+
+    image = sprite(w=12, h=12, seed=4)  # 140 opaque pixels; the 3x4 grid holds 48 slots
+    request = {"representation": "gray", "basis": "z", "images": [image]}
+    request["shots"] = 50_000
+    ticket = runners.ibm_submit(request, {})
+    assert runs == [3] and ticket["bands"] == 3 and ticket["n_circuits"] == 3
+    out = runners.ibm_status(request, {}, ticket)
+    assert out["bands"] == 3 and out["run"]["bands"] == 3
+    assert out["n_pixels"] == 140 and (out["width"], out["height"]) == (12, 12)
+    assert out["metrics"]["mean_abs_error_255"] < 6
 
 
 # ----------------------------------------------------------------------

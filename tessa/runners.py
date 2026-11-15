@@ -5,6 +5,12 @@ physical qubits it occupies, with that chip's calibrated noise. Hardware runs th
 whole circuit, one job per request; the page polls :func:`ibm_status` until it is
 done. Nothing is stored server side: the page sends the request again with the
 job id, and the plan is rebuilt from it.
+
+An image too big for the chip runs in bands (:mod:`tessa.split`). The simulator
+runs one band per request (``band`` in the request), so each request stays short,
+and the page joins the bands. Hardware sends every band's circuits in one job, so
+the bands wait in the queue once and run under one calibration, and
+:func:`ibm_status` joins them.
 """
 
 from __future__ import annotations
@@ -18,7 +24,7 @@ from iqpixl.backends.base import counts_of
 from iqpixl.codec import _measured
 from iqpixl.core import get_mode
 
-from . import devices
+from . import devices, split
 from .pipeline import build_plan, finish, shots_of
 
 
@@ -28,8 +34,11 @@ def _noiseless_sampler(device: str):
 
 
 def simulate(request: dict) -> dict:
+    """One run on Aer; with ``band``, one band of an image too big for the chip."""
     device = request.get("device", "phoenix")
     graph = devices.graph(device)
+    if "band" in request:
+        request = split.band_request(request, graph.capacity, int(request["band"]))
     plan = build_plan(request, graph)
     noisy = request.get("noise", "calibrated") != "none"
     sampler = devices.noisy_sampler(device) if noisy else _noiseless_sampler(device)
@@ -49,6 +58,8 @@ def simulate(request: dict) -> dict:
         "shots": shots,
         "calibrated_at": devices.snapshot_backend(device).snapshot["calibrated_at"],
     }
+    if "split" in request:
+        out["split"] = request["split"]
     return out
 
 
@@ -76,6 +87,32 @@ def hardware_circuits(plan) -> list:
     ]
 
 
+def band_circuits(requests: list[dict], graph) -> tuple[list, list[int]]:
+    """Every band's circuits, band after band, and how many each band has."""
+    circuits, sizes = [], []
+    for request in requests:
+        own = hardware_circuits(build_plan(request, graph))
+        circuits += own
+        sizes.append(len(own))
+    return circuits, sizes
+
+
+def decode_bands(requests: list[dict], graph, counts: list[dict]) -> dict:
+    """Counts of :func:`band_circuits`, in the same order -> one joined result."""
+    results, i = [], 0
+    for request in requests:
+        plan = build_plan(request, graph)
+        n = len(hardware_circuits(plan))
+        out = decode_hardware(plan, counts[i : i + n])
+        i += n
+        if "split" in request:
+            out["split"] = request["split"]
+        results.append(out)
+    if i != len(counts):
+        raise ValueError(f"expected {i} circuits' counts, got {len(counts)}")
+    return split.join(results)
+
+
 def decode_hardware(plan, counts: list[dict]) -> dict:
     """Counts of :func:`hardware_circuits`, in the same order -> :func:`finish`."""
     symbolic = "symbols" in plan.extra  # decoded from counts, see pipeline.finish
@@ -92,13 +129,14 @@ def decode_hardware(plan, counts: list[dict]) -> dict:
 
 
 def ibm_submit(request: dict, credentials: dict) -> dict:
-    """Encode on the live chip's graph, run every measurement setting in one job."""
+    """Encode on the live chip's graph, run every measurement setting (of every
+    band, for an image too big for the chip) in one job."""
     from qiskit_ibm_runtime import SamplerV2
 
     device = request.get("device", "phoenix")
     backend = _service(credentials).backend(devices.DEVICES[device])
     graph = graph_from_coupling(backend.coupling_map.get_edges(), backend.num_qubits)
-    circuits = hardware_circuits(build_plan(request, graph))
+    circuits, sizes = band_circuits(split.band_requests(request, graph.capacity), graph)
     transpiled = transpile(
         circuits,
         backend,
@@ -113,6 +151,7 @@ def ibm_submit(request: dict, credentials: dict) -> dict:
         "job_id": job.job_id(),
         "backend": backend.name,
         "n_circuits": len(transpiled),
+        "bands": len(sizes),
         "shots": shots,
         # The graph the job was encoded on, so decoding never depends on the chip
         # still having every coupler when the job finishes.
@@ -131,9 +170,10 @@ def ibm_status(request: dict, credentials: dict, ticket: dict) -> dict:
         return {"status": status}
 
     graph = graph_from_coupling(ticket["edges"], ticket["n_qubits"])
-    plan = build_plan(request, graph)
+    requests = split.band_requests(request, graph.capacity)
     result = job.result()
-    out = decode_hardware(plan, [counts_of(result, i) for i in range(len(result))])
+    counts = [counts_of(result, i) for i in range(len(result))]
+    out = decode_bands(requests, graph, counts)
     out["status"] = status
     out["run"] = {
         "kind": "hardware",
@@ -141,4 +181,6 @@ def ibm_status(request: dict, credentials: dict, ticket: dict) -> dict:
         "job_id": ticket["job_id"],
         "shots": ticket["shots"],
     }
+    if len(requests) > 1:
+        out["run"]["bands"] = len(requests)
     return out

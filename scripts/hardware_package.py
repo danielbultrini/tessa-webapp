@@ -1,9 +1,12 @@
 """Send a package of TESSA images to IBM hardware as one job, and wait for the result.
 
 A package file (TOML) lists the images and the settings, the same ones the page
-offers. Every image's circuits go into one IBM job. Everything the run needs is
-saved in an output folder as it happens, so a lost connection or a restart costs
-nothing: run the same command again and it picks up where it stopped.
+offers. Every image's circuits go into one IBM job. An image too big for the chip
+is split into bands that each fit (``tessa.split``), as the page does, and its
+bands go into the same job; its results are joined into one image. Everything
+the run needs is saved in an output folder as it happens, so a lost connection or
+a restart costs nothing: run the same command again and it picks up where it
+stopped.
 
 From ``webapp/``::
 
@@ -58,9 +61,9 @@ WEBAPP = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(WEBAPP))  # the vendored iqpixl copy and tessa
 
 import numpy as np  # noqa: E402
-from tessa import devices  # noqa: E402
+from tessa import devices, split  # noqa: E402
 from tessa.pipeline import build_plan, shots_of  # noqa: E402
-from tessa.runners import decode_hardware, hardware_circuits  # noqa: E402
+from tessa.runners import band_circuits, decode_bands, hardware_circuits  # noqa: E402
 
 from iqpixl import graph_from_coupling  # noqa: E402
 from iqpixl.backends.base import counts_of  # noqa: E402
@@ -224,11 +227,13 @@ def copy_without_key(source: Path, target: Path, package: dict) -> None:
     target.write_text(text)
 
 
-def plans_on(graph, entries: list[dict]) -> list:
+def plans_on(graph, entries: list[dict]) -> list[list]:
+    """Each run's plans: one per band (one band if the image fits the chip)."""
     out = []
     for e in entries:
         try:
-            out.append(build_plan(e["request"], graph))
+            bands = split.band_requests(e["request"], graph.capacity)
+            out.append([build_plan(b, graph) for b in bands])
         except ValueError as exc:
             raise ValueError(f"run {e['label']!r}: {exc}") from exc
     return out
@@ -247,19 +252,22 @@ def check(args) -> None:
         f"(calibration snapshot, {graph.capacity} slots)"
     )
     print(
-        f"{'label':24} {'encode':22} {'pixels':>6} {'slots':>5} {'circuits':>8} {'shots':>6}"
+        f"{'label':24} {'encode':22} {'pixels':>6} {'parts':>5} {'slots':>6} "
+        f"{'circuits':>8} {'shots':>6}"
     )
     total = 0
-    for e, plan in zip(entries, plans, strict=True):
-        r = e["request"]
+    for e, bands in zip(entries, plans, strict=True):
+        r, plan = e["request"], bands[0]
         what = f"{plan.representation} {plan.basis}"
         if plan.representation == "transition":
             what += f" {r.get('transition_values', 'gray')}"
-        n = len(hardware_circuits(plan))
+        n = sum(len(hardware_circuits(b)) for b in bands)
+        pixels = sum(int(b.mask.sum()) for b in bands)
+        slots = sum(np.unique(b.slot).size for b in bands)
         total += n
         print(
-            f"{e['label']:24} {what:22} {int(plan.mask.sum()):>6} "
-            f"{np.unique(plan.slot).size:>5} {n:>8} {shots_of(r):>6}"
+            f"{e['label']:24} {what:22} {pixels:>6} {len(bands):>5} {slots:>6} "
+            f"{n:>8} {shots_of(r):>6}"
         )
     print(f"{total} circuits in one job. Nothing was sent.")
 
@@ -284,11 +292,12 @@ def prepare(
         "fetching the backend", lambda: service.backend(devices.DEVICES[device]), log
     )
     graph = graph_from_coupling(backend.coupling_map.get_edges(), backend.num_qubits)
-    plans = plans_on(graph, entries)
+    plans_on(graph, entries)  # every run's error at once, before anything is saved
 
     circuits, runs = [], []
-    for e, plan in zip(entries, plans, strict=True):
-        own = hardware_circuits(plan)
+    for e in entries:
+        bands = split.band_requests(e["request"], graph.capacity)
+        own, sizes = band_circuits(bands, graph)
         request_file = f"requests/{e['label']}.json"
         write_json(folder / request_file, e["request"])
         runs.append(
@@ -298,6 +307,7 @@ def prepare(
                 "request_file": request_file,
                 "first": len(circuits),
                 "n_circuits": len(own),
+                "bands": len(sizes),
                 "shots": shots_of(e["request"]),
             }
         )
@@ -560,11 +570,11 @@ def decode_folder(folder: Path, log: Log, scale: int = 8) -> None:
         where = folder / "results" / run["label"]
         where.mkdir(parents=True, exist_ok=True)
         try:
-            plan = build_plan(request, graph)
+            bands = split.band_requests(request, graph.capacity)
             counts = [
                 counts_of(result, run["first"] + i) for i in range(run["n_circuits"])
             ]
-            out = decode_hardware(plan, counts)
+            out = decode_bands(bands, graph, counts)
         except Exception as exc:  # one bad run never hides the others
             row["error"] = f"{type(exc).__name__}: {exc}"
             write_json(where / "error.json", row)
@@ -579,6 +589,8 @@ def decode_folder(folder: Path, log: Log, scale: int = 8) -> None:
             "first_circuit": run["first"],
             "n_circuits": run["n_circuits"],
         }
+        if len(bands) > 1:
+            out["run"]["bands"] = len(bands)
         out["settings"] = settings
         write_json(where / "result.json", out)
         save_images(where, out, scale)
@@ -586,6 +598,7 @@ def decode_folder(folder: Path, log: Log, scale: int = 8) -> None:
             n_pixels=out["n_pixels"],
             slots_used=out["slots_used"],
             capacity=out["capacity"],
+            parts=out.get("bands", 1),
             drr_method=out["drr"]["method"],
         )
         row.update({f"raw.{k}": v for k, v in out["metrics"].items()})

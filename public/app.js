@@ -84,10 +84,9 @@ const state = {
   result: null,
   resultDevice: null,
   request: null,
-  jobs: null, // { requests, owner, tickets, results }: one entry per job
+  ticket: null,
   credentials: null,
   timer: null,
-  polling: false,
   hoverGroup: -1,
   frame: 0,
   layer: 0,
@@ -167,9 +166,10 @@ function opaqueMask() {
   return mask;
 }
 
-// How the image is split into jobs: one job if it fits (as is, or with a few
-// grayscale pixels), more if it does not. Null until there is something to run.
-function jobPlan() {
+// How many parts the image runs in: one if it fits (as is, or with a few
+// grayscale pixels), more if it does not (tessa/split.py cuts the same bands).
+// Null until there is something to run.
+function bandPlan() {
   const d = state.devices && state.devices[device()];
   const mask = opaqueMask();
   if (!d || mask === null || mask === "size") return null;
@@ -177,9 +177,18 @@ function jobPlan() {
   const room = d.capacity * valuesPerSlot();
   const gray = valuesPerPixel() === 3 ? grayscaleNeeded(n, room) : 0;
   const slots = Math.ceil((n * valuesPerPixel() - 2 * gray) / valuesPerSlot());
-  if (n === 0 || slots <= d.capacity) return { jobs: 1, owner: null, n, gray, slots };
-  const perJob = Split.pixelsPerJob(d.capacity, valuesPerSlot(), valuesPerPixel());
-  return { ...Split.plan(mask, perJob), n, gray: 0, slots };
+  if (n === 0 || slots <= d.capacity) return { bands: 1, n, gray, slots };
+  return { bands: Split.count(n, Split.pixelsPerBand(d.capacity, valuesPerSlot(), valuesPerPixel())), n, gray: 0, slots };
+}
+
+// A Vercel function sends back at most 4.5 MB. Roughly how big the whole image's
+// result is: base64 RGBA for the raw and recovered image (each readout angle of a
+// transition), and the per-pixel qubit maps.
+const VERCEL_LIMIT_MB = 4.5;
+function resultMegabytes() {
+  const im = state.images[0];
+  const frames = representation() === "transition" ? Math.min(15, Math.max(2, Number($("alphas").value) || 9)) : 1;
+  return (im.width * im.height * (2 * frames * 16 / 3 + 4 * valuesPerPixel() * 3.5)) / 1e6;
 }
 
 function checkFit() {
@@ -194,18 +203,33 @@ function checkFit() {
     fit.textContent = "The two images must have the same size.";
     fit.className = "note bad";
   } else {
-    const { n, gray, slots, jobs } = jobPlan();
+    const { n, gray, slots, bands } = bandPlan();
     const room = d.capacity * valuesPerSlot();
     ok = n > 0;
     const what = valuesPerPixel() === 3 ? `${n} opaque pixels x 3 channels` : `${n} opaque pixels`;
-    if (jobs > 1) {
-      const each = Math.ceil(n / jobs);
+    // One response carries the whole image: from IBM always, from the simulator
+    // when there is one part (a split simulation returns each band on its own).
+    const mb = resultMegabytes();
+    const tooBig =
+      ok && (target() === "ibm" || bands === 1) && mb > VERCEL_LIMIT_MB
+        ? ` The result is about ${mb.toFixed(1)} MB, and a Vercel deployment sends back at most ` +
+          `${VERCEL_LIMIT_MB} MB, so on Vercel it will not arrive. Use fewer readout angles or a smaller image, ` +
+          `or run the app on your own computer, which has no such limit.`
+        : "";
+    if (bands > 1) {
+      const each = Math.ceil(n / bands);
+      const how =
+        target() === "ibm"
+          ? `All parts go to IBM as one job, so they wait in the queue once and run under one calibration. ` +
+            `More parts make a longer job that uses more of your IBM time.`
+          : `The simulator runs the parts one after the other. Each part takes as long as a full run.`;
       fit.textContent =
         `${what} need ${slots} slots, more than the ${d.capacity} on ${d.name}. ` +
-        `The image will be split into ${jobs} jobs of about ${each} pixels each. ` +
-        `The jobs run one after the other${target() === "ibm" ? " as separate IBM jobs" : ""}, ` +
-        `and the results are joined into one image. ` +
-        `Each job takes as long as a full run, and a large number of jobs can time out or crash the page.`;
+        `The image will be split into ${bands} parts of about ${each} pixels each, and the results joined into one image. ` +
+        `${how} A large number of parts can time out or crash the page.${tooBig}`;
+      fit.className = "note warn";
+    } else if (tooBig) {
+      fit.textContent = `${what} need ${slots} of the ${d.capacity} slots on ${d.name}. It fits.${tooBig}`;
       fit.className = "note warn";
     } else if (gray) {
       fit.textContent =
@@ -436,57 +460,47 @@ function setStatus(text, cls = "") {
   $("status").className = "note " + cls;
 }
 
-// One request per job. A single job sends the request unchanged.
-function jobRequests(request, split) {
-  if (split.jobs === 1) return [request];
-  const { images, ...base } = request;
-  const imgs = representation() === "transition" ? state.images : [state.images[0]];
-  return Array.from({ length: split.jobs }, (_, j) => Split.request(base, imgs, split.owner, j, split.jobs));
-}
-
 async function run() {
   if (!checkFit()) return;
   const request = buildRequest();
-  const split = jobPlan();
-  const requests = jobRequests(request, split);
-  const jobs = requests.length;
-  const label = (j) => (jobs > 1 ? ` ${j + 1} of ${jobs}` : "");
-  state.request = jobs > 1 ? { ...request, jobs } : request;
-  state.jobs = { requests, owner: split.owner, tickets: [], results: [] };
+  const bands = bandPlan().bands;
+  state.request = request;
   $("run").disabled = true;
   try {
     if (target() === "ibm") {
       state.credentials = { token: $("token").value, instance: $("instance").value };
-      for (let j = 0; j < jobs; j++) {
-        setStatus(`Encoding and submitting job${label(j)} to IBM...`);
-        try {
-          state.jobs.tickets.push(await post("/api/ibm/submit", { request: requests[j], credentials: state.credentials }));
-        } catch (err) {
-          const sent = state.jobs.tickets.map((t) => t.job_id);
-          throw new Error(
-            `Job${label(j)} was not submitted: ${err.message}` +
-              (sent.length ? ` These jobs were already submitted: ${sent.join(", ")}.` : "")
-          );
-        }
-      }
-      const ids = state.jobs.tickets.map((t) => t.job_id).join(", ");
-      setStatus(`Submitted to ${state.jobs.tickets[0].backend}: ${ids}. Checking every 30 s...`);
+      setStatus(bands > 1 ? `Encoding ${bands} parts and submitting them to IBM as one job...` : "Encoding and submitting to IBM...");
+      state.ticket = await post("/api/ibm/submit", { request, credentials: state.credentials });
+      const parts = state.ticket.bands > 1 ? ` with ${state.ticket.bands} parts (${state.ticket.n_circuits} circuits)` : "";
+      setStatus(`Job ${state.ticket.job_id}${parts} submitted to ${state.ticket.backend}. Checking every 30 s...`);
       state.timer = setInterval(poll, 30000);
       poll();
       return;
     }
     const t0 = performance.now();
-    for (let j = 0; j < jobs; j++) {
-      setStatus(`Simulating${jobs > 1 ? ` job${label(j)}` : ""}...`);
-      try {
-        state.jobs.results.push(await post("/api/simulate", requests[j]));
-      } catch (err) {
-        throw new Error(`Job${label(j)} failed: ${err.message}`);
+    let result;
+    if (bands === 1) {
+      setStatus("Simulating...");
+      result = await post("/api/simulate", request);
+    } else {
+      // The backend cuts the bands; each request runs one, so each stays short.
+      const results = [];
+      for (let j = 0; j < bands; j++) {
+        setStatus(`Simulating part ${j + 1} of ${bands}...`);
+        try {
+          results.push(await post("/api/simulate", { ...request, band: j }));
+        } catch (err) {
+          throw new Error(`Part ${j + 1} of ${bands} failed: ${err.message}`);
+        }
+        if (results[j].split.of !== bands) {
+          throw new Error(`The server cut ${results[j].split.of} parts, the page expected ${bands}. Reload the page.`);
+        }
       }
+      result = Split.join(results);
     }
-    const jobsText = jobs > 1 ? ` (${jobs} jobs)` : "";
-    setStatus(`Done in ${((performance.now() - t0) / 1000).toFixed(1)} s${jobsText}.`, "good");
-    show(Split.join(state.jobs.results, state.jobs.owner), request.device);
+    const parts = bands > 1 ? `, ${bands} parts` : "";
+    setStatus(`Done in ${((performance.now() - t0) / 1000).toFixed(1)} s${parts}.`, "good");
+    show(result, request.device);
   } catch (err) {
     setStatus(err.message, "bad");
   } finally {
@@ -494,40 +508,22 @@ async function run() {
   }
 }
 
-// Ask about every job that is not done yet; join the results once all are done.
 async function poll() {
-  if (state.polling) return; // the last check of many jobs is still running
-  state.polling = true;
   try {
-    await pollOnce();
-  } finally {
-    state.polling = false;
-  }
-}
-
-async function pollOnce() {
-  const { requests, tickets, results } = state.jobs;
-  const jobs = tickets.length;
-  const name = (j) => `Job ${tickets[j].job_id}${jobs > 1 ? ` (${j + 1} of ${jobs})` : ""}`;
-  let last = "";
-  try {
-    for (let j = 0; j < jobs; j++) {
-      if (results[j]) continue;
-      const out = await post("/api/ibm/status", { request: requests[j], credentials: state.credentials, ticket: tickets[j] });
-      if (out.status === "DONE") results[j] = out;
-      else if (out.status === "ERROR" || out.status === "CANCELLED") {
-        stopPolling();
-        setStatus(`${name(j)}: ${out.status}. ${out.error || ""}`, "bad");
-        return;
-      } else last = `${name(j)} on ${tickets[j].backend}: ${out.status}.`;
-    }
-    const done = results.filter(Boolean).length;
-    if (done === jobs) {
+    const out = await post("/api/ibm/status", {
+      request: state.request,
+      credentials: state.credentials,
+      ticket: state.ticket,
+    });
+    if (out.status === "DONE") {
       stopPolling();
-      setStatus(jobs > 1 ? `All ${jobs} jobs are done.` : `Job ${tickets[0].job_id} is done.`, "good");
-      show(Split.join(results, state.jobs.owner), state.request.device);
+      setStatus(`Job ${state.ticket.job_id} is done.`, "good");
+      show(out, state.request.device);
+    } else if (out.status === "ERROR" || out.status === "CANCELLED") {
+      stopPolling();
+      setStatus(`Job ${state.ticket.job_id}: ${out.status}. ${out.error || ""}`, "bad");
     } else {
-      setStatus(`${jobs > 1 ? `${done} of ${jobs} jobs done. ` : ""}${last} Checking again in 30 s.`);
+      setStatus(`Job ${state.ticket.job_id} on ${state.ticket.backend}: ${out.status}. Checking again in 30 s.`);
     }
   } catch (err) {
     stopPolling();
@@ -596,7 +592,7 @@ function show(result, dev) {
   drawOutput();
   drawChip();
   const m = { ...result.metrics, colorspace: result.colorspace, mapping: result.mapping, pixels: result.n_pixels, slots_used: result.slots_used, capacity: result.capacity, ...result.run };
-  if (result.drr.methods) m.drr_method_per_job = result.drr.methods.join(", ");
+  if (result.drr.methods) m.drr_method_per_part = result.drr.methods.join(", ");
   const fmt = (v) => (typeof v === "number" && !Number.isInteger(v) ? v.toFixed(3) : v);
   const scores = Object.entries(result.drr.scores)
     .map(([k, v]) => `${k} ${v.toFixed(2)}`)
@@ -776,8 +772,8 @@ function downloadJson() {
     pixel_group: r.pixel_group,
     pixel_address: r.pixel_address,
     pixel_part: r.pixel_part,
-    jobs: r.jobs,
-    pixel_job: r.pixel_job,
+    bands: r.bands,
+    pixel_band: r.pixel_band,
     palette: r.palette,
     drr: { method: r.drr.method, methods: r.drr.methods, metrics: r.drr.metrics, scores: r.drr.scores },
     alphas_degrees: r.alphas_degrees,
@@ -848,8 +844,8 @@ function hoverText(i) {
     const part = r.symbol_scheme === "constellation" ? SPHERE_PART[r.basis][p] : PART[p];
     return `data qubit q${grp.data} (${grp.n_values} slots), in the slot where its address qubits read ${bits}, in the ${part}`;
   };
-  const job = r.pixel_job ? `, in job ${r.pixel_job[i] + 1} of ${r.jobs},` : "";
-  const at = `Pixel (${i % r.width}, ${Math.floor(i / r.width)})${job}`;
+  const band = r.pixel_band ? `, in part ${r.pixel_band[i] + 1} of ${r.bands},` : "";
+  const at = `Pixel (${i % r.width}, ${Math.floor(i / r.width)})${band}`;
   if (!r.channels) return `${at} lives on ${where(0)}.`;
   if (layerOf(r, "pixel_group", 1)[i] < 0) return `${at} is stored in grayscale: its brightness is on ${where(0)}.`;
   return `${at}: ` + r.channels.map((c, k) => `${c} on ${where(k)}`).join("; ") + ".";
@@ -895,7 +891,7 @@ function onChipHover(ev) {
   const held = r.channels
     ? r.channels.map((c, k) => `${count(k)} ${c}`).join(", ") + " values"
     : `${count(0)} pixel${count(0) === 1 ? "" : "s"}`;
-  const across = r.jobs ? `, across ${r.jobs} jobs` : "";
+  const across = r.bands ? `, across ${r.bands} parts` : "";
   setHover(
     best,
     `Data qubit q${g.data} with address qubits ${g.addresses.map((q) => "q" + q).join(", ")}: ` +
@@ -919,6 +915,7 @@ async function init() {
   $("file-b").addEventListener("change", (e) => e.target.files[0] && loadFile(e.target.files[0], 1));
   $("run").addEventListener("click", run);
   $("transition-values").addEventListener("change", showPalette);
+  $("alphas").addEventListener("input", checkFit); // more angles, a bigger result
   document.querySelectorAll("button[data-order]").forEach((el) =>
     el.addEventListener("click", () => sortPalette(el.dataset.order))
   );

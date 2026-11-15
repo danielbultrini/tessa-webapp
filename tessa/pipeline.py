@@ -35,10 +35,10 @@ the input and never encoded)
 Transparent pixels (alpha < 128) are not encoded, and come back transparent.
 Which slot each pixel takes is the request's ``mapping`` (see :mod:`tessa.mapping`).
 
-An image too big for the chip is split by the page into several requests, one
-band of pixels each, with ``split = {"job": i, "of": n}``. Every band keeps the
+An image too big for the chip is split into bands that each fit (see
+:mod:`tessa.split`). A band's request carries ``split``. Every band keeps the
 whole image's palette order, so a colour sits at the same place on the qubit's
-axis in every job: a split request's ``palette_order`` may list colours that its
+axis in every band: a split request's ``palette_order`` may list colours that its
 own pixels do not use.
 """
 
@@ -354,11 +354,9 @@ def build_plan(request: dict, graph) -> Plan:
     if n == 0:
         raise ValueError("the image has no opaque pixels")
     one_number = rep in ("gray", "palette", "color")
-    layers = 3 if rep == "color" else 1
-    per_slot = 2 if one_number and basis in ("zx", "zxy", "sphere2") else 1
+    layers, per_slot = slot_cost(rep, basis)
     # Full colour just short of room: the last few pixels go grayscale (one number).
-    n_gray = grayscale_needed(n, graph.capacity * per_slot) if layers == 3 else 0
-    slots = -(-(layers * n - 2 * n_gray) // per_slot)
+    n_gray, slots = slots_needed(n, layers, per_slot, graph.capacity)
     if slots > graph.capacity:
         what = f"{n} opaque pixels" + (" x 3 channels" if layers == 3 else "")
         raise ValueError(f"{what} need {slots} slots, but this chip has {graph.capacity}")
@@ -444,6 +442,21 @@ def build_plan(request: dict, graph) -> Plan:
     return Plan(
         rep, basis, mask.shape, mask, readouts, slot, part, groups, graph.capacity, extra
     )
+
+
+def slot_cost(rep: str, basis: str) -> tuple[int, int]:
+    """``(numbers per pixel, numbers per slot)`` of a representation and basis."""
+    one_number = rep in ("gray", "palette", "color")
+    layers = 3 if rep == "color" else 1
+    per_slot = 2 if one_number and basis in ("zx", "zxy", "sphere2") else 1
+    return layers, per_slot
+
+
+def slots_needed(n: int, layers: int, per_slot: int, capacity: int) -> tuple[int, int]:
+    """``(grayscale pixels, slots)`` for ``n`` opaque pixels: full colour just short
+    of room stores its last few pixels in grayscale (see :func:`grayscale_needed`)."""
+    n_gray = grayscale_needed(n, capacity * per_slot) if layers == 3 else 0
+    return n_gray, -(-(layers * n - 2 * n_gray) // per_slot)
 
 
 def grayscale_needed(n: int, room: int) -> int:

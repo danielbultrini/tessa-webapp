@@ -39,15 +39,17 @@ FastAPI backend does the quantum work, and a static page in `public/` is the int
    opaque 23 x 23 image fits that way, with 2 grayscale pixels. The three channels are encoded as three stacked images, so the mapping lays
    out each channel like a picture, and the page shows one qubit map per channel.
 
-   If an image is too big for the chip, the page splits it into jobs and shows a
-   warning with the number of jobs. Each job holds one band of opaque pixels, in
-   reading order, and the bands are of nearly equal size. The jobs run one after the
-   other, on the simulator or as separate IBM jobs, and the page joins the results
-   into one image. Every job uses the whole image's palette order, so each colour
-   has the same place on the qubit's axis in every job. Each job picks its own best
-   DRR method. If the methods differ, the DRR result shows "per job". Many jobs take
-   a long time, and a large number can time out or crash the page. The upload limit
-   of 256 x 256 pixels does not change.
+   If an image is too big for the chip, it runs in parts, and the page shows a
+   warning with the number of parts. `tessa/split.py` cuts the opaque pixels, in
+   reading order, into bands of nearly equal size that each fit on the chip. The
+   simulator runs the parts one after the other, one request each, and the page
+   joins the results. On IBM hardware, every part goes into one job, so the parts
+   wait in the queue once and run under one calibration. The backend then joins the
+   results. Every part uses the whole image's palette order, so each colour has the
+   same place on the qubit's axis in every part. Each part picks its own best DRR
+   method. If the methods differ, the DRR result shows "per part". Many parts take a
+   long time, and a large number can time out or crash the page. The upload limit of
+   256 x 256 pixels does not change.
    For a palette, a "Palette order" panel shows the image's colours along the qubit's
    axis: the first colour is stored at value 0 (the |0> end), the last at value 1.
    Drag a swatch to move it, or sort dark to light, light to dark, by hue, or at
@@ -93,9 +95,10 @@ FastAPI backend does the quantum work, and a static page in `public/` is the int
 | Path | Contents |
 |---|---|
 | `app.py` | The FastAPI app. Vercel finds it with no configuration. |
-| `public/` | The page: `index.html`, `app.js`, `export.js` (GIF and ZIP writers), `split.js` (splits a big image into jobs and joins the results), `style.css`. |
+| `public/` | The page: `index.html`, `app.js`, `export.js` (GIF and ZIP writers), `split.js` (joins the parts of a big image), `style.css`. |
 | `tessa/pipeline.py` | Pixels to circuits, and decoded counts back to pixels. |
 | `tessa/mapping.py` | Which pixels each data qubit holds. |
+| `tessa/split.py` | Splits an image too big for the chip into bands, and joins their results. |
 | `tessa/runners.py` | The simulator, and IBM job submission and status. |
 | `tessa/devices.py` | The two chips, rebuilt from their calibration snapshots. |
 | `tessa/devices/*.json` | Calibration snapshots of `ibm_fez` and `ibm_phoenix`. |
@@ -127,6 +130,14 @@ Then open http://127.0.0.1:8000.
 `vercel.json` lets one request run for 300 seconds, the Hobby limit. A simulation
 takes a few seconds per image. A transition takes longer, because each readout angle
 is one more simulation. The Python bundle is about 200 MB, under the 500 MB limit.
+
+One response from Vercel holds at most 4.5 MB. A part of a split simulation holds
+only its own rows, so it stays small. An IBM result holds the whole image. A large
+transition with many readout angles can pass 4.5 MB, and then the result does not
+arrive. The page warns about this before you run. When you run the app on your own
+computer, this limit does not apply. Transpiling 30 full parts for `ibm_phoenix`
+takes less than one second, and decoding one part takes at most 0.2 seconds. The
+time to download a large result from IBM is not measured.
 
 ## Send a package of images to IBM hardware
 
@@ -161,7 +172,9 @@ The output goes to `../data/hardware/<name>/`, or to `--out`. The folder holds t
 job ID, the transpiled circuits, the raw job result, and a log. It also holds IBM's
 timestamps and usage, and the chip calibration at submission and at execution. For
 each image, it holds the result JSON and the raw and DRR PNGs. `summary.csv` has one row per image with its settings
-and its metrics. If the job fails, `job/error.json` has IBM's error message. To
+and its metrics. An image too big for the chip runs in parts, as on the page. Its
+parts go into the same job, and its result is joined into one image. `check` and
+`summary.csv` show the number of parts. If the job fails, `job/error.json` has IBM's error message. To
 decode the saved result again without IBM, run `hardware_package.py decode` on the
 folder.
 
